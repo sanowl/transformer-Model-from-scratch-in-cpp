@@ -4,6 +4,10 @@
 #include <memory>
 #include <vector>
 
+// Forward declarations
+class PositionalEncodingBase;
+class RotaryPositionalEncoding;
+
 class MultiHeadAttention {
 private:
     size_t d_model_;
@@ -21,6 +25,10 @@ private:
     std::unique_ptr<Tensor> b_k_;
     std::unique_ptr<Tensor> b_v_;
     std::unique_ptr<Tensor> b_o_;
+    
+    // RoPE support
+    RotaryPositionalEncoding* rope_encoding_;
+    bool use_rope_;
 
 public:
     MultiHeadAttention(size_t d_model, size_t n_heads, float dropout = 0.1f);
@@ -40,6 +48,11 @@ public:
     void init_parameters();
     
     std::vector<Tensor*> parameters();
+    
+    // RoPE integration methods
+    void set_rope_encoding(RotaryPositionalEncoding* rope_encoding);
+    void enable_rope(bool enable) { use_rope_ = enable; }
+    bool is_rope_enabled() const { return use_rope_; }
     
 private:
     Tensor linear_transform(const Tensor& input, const Tensor& weight, const Tensor& bias);

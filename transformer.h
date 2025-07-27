@@ -2,6 +2,7 @@
 
 #include "attention.h"
 #include "tensor.h"
+#include "positional_encoding.h"
 #include <vector>
 #include <memory>
 
@@ -35,15 +36,23 @@ private:
     float dropout_rate_;
     
     std::unique_ptr<Tensor> token_embedding_;
-    std::unique_ptr<PositionalEncoding> pos_encoding_;
+    std::unique_ptr<PositionalEncodingBase> pos_encoding_;
     std::vector<std::unique_ptr<TransformerBlock>> layers_;
     std::unique_ptr<LayerNorm> final_norm_;
     std::unique_ptr<Tensor> output_projection_;
+    
+    // Positional encoding configuration
+    PositionalEncodingConfig pos_config_;
 
 public:
     TransformerModel(size_t vocab_size, size_t d_model, size_t n_heads, 
                     size_t n_layers, size_t d_ff, size_t max_seq_len = 512, 
                     float dropout = 0.1f);
+    
+    // Constructor with positional encoding configuration
+    TransformerModel(size_t vocab_size, size_t d_model, size_t n_heads, 
+                    size_t n_layers, size_t d_ff, size_t max_seq_len, 
+                    float dropout, const PositionalEncodingConfig& pos_config);
     
     Tensor forward(const std::vector<size_t>& input_ids, const Tensor* mask = nullptr, bool training = true);
     Tensor generate_causal_mask(size_t seq_len);
@@ -53,8 +62,14 @@ public:
     
     Tensor embedding_lookup(const std::vector<size_t>& input_ids);
     
+    // Positional encoding management
+    void set_positional_encoding(PositionalEncodingType type, float rope_base = 10000.0f);
+    PositionalEncodingBase* get_positional_encoding() const { return pos_encoding_.get(); }
+    const PositionalEncodingConfig& get_pos_config() const { return pos_config_; }
+    
 private:
     void init_embeddings();
+    void init_positional_encoding();
 };
 
 class SimpleTokenizer {

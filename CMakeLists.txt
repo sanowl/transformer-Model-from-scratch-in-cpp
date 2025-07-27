@@ -32,6 +32,7 @@ set(SOURCES
     attention.cpp
     transformer.cpp
     trainer.cpp
+    positional_encoding.cpp
     main.cpp
 )
 
@@ -41,6 +42,7 @@ set(HEADERS
     attention.h
     transformer.h
     trainer.h
+    positional_encoding.h
 )
 
 # Create the executable
