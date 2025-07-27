@@ -176,7 +176,7 @@ Int8MultiHeadAttention::Int8MultiHeadAttention(const MultiHeadAttention& fp32_at
     
     // In a real implementation, you would extract the actual weights from fp32_attention
     // For now, we'll create dummy quantized weights
-    Tensor dummy_weight({d_model_, d_model_});
+    Tensor dummy_weight(std::vector<size_t>{d_model_, d_model_});
     dummy_weight.normal_(0.0f, 0.02f);
     
     W_q_ = std::make_unique<QuantizedTensor>(QuantizationUtils::quantize_tensor_symmetric(dummy_weight));

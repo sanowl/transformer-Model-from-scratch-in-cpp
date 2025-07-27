@@ -4,6 +4,10 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <functional>
+#include <chrono>
+#include <mutex>
+#include <atomic>
 
 struct TrainingConfig {
     size_t vocab_size = 10000;

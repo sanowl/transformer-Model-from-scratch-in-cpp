@@ -71,25 +71,39 @@ void TransformerModel::init_embeddings() {
 }
 
 Tensor TransformerModel::embedding_lookup(const std::vector<size_t>& input_ids) {
-    size_t seq_len = input_ids.size();
-    Tensor embeddings({seq_len, d_model_});
-    
-    for (size_t i = 0; i < seq_len; ++i) {
-        size_t token_id = input_ids[i];
-        if (token_id >= vocab_size_) {
-            throw std::out_of_range("Token ID out of vocabulary range");
-        }
-        
-        for (size_t j = 0; j < d_model_; ++j) {
-            embeddings.matrix()(i, j) = token_embedding_->matrix()(token_id, j);
-        }
+    if (input_ids.empty()) {
+        throw TensorShapeError("Input IDs cannot be empty");
     }
     
-    return embeddings;
+    size_t seq_len = input_ids.size();
+    if (seq_len > max_seq_len_) {
+        throw TensorShapeError("Input sequence length (" + std::to_string(seq_len) + 
+                             ") exceeds maximum (" + std::to_string(max_seq_len_) + ")");
+    }
+    
+    try {
+        Tensor embeddings(std::vector<size_t>{seq_len, d_model_});
+        
+        for (size_t i = 0; i < seq_len; ++i) {
+            size_t token_id = input_ids[i];
+            if (token_id >= vocab_size_) {
+                throw TensorShapeError("Token ID (" + std::to_string(token_id) + 
+                                     ") out of vocabulary range (0-" + std::to_string(vocab_size_ - 1) + ")");
+            }
+            
+            for (size_t j = 0; j < d_model_; ++j) {
+                embeddings.matrix()(i, j) = token_embedding_->matrix()(token_id, j);
+            }
+        }
+        
+        return embeddings;
+    } catch (const std::exception& e) {
+        throw TensorMemoryError("Embedding lookup failed: " + std::string(e.what()));
+    }
 }
 
 Tensor TransformerModel::generate_causal_mask(size_t seq_len) {
-    Tensor mask({seq_len, seq_len});
+    Tensor mask(std::vector<size_t>{seq_len, seq_len});
     
     for (size_t i = 0; i < seq_len; ++i) {
         for (size_t j = 0; j < seq_len; ++j) {
@@ -263,7 +277,7 @@ float CrossEntropyLoss::compute_loss(const Tensor& logits, const std::vector<siz
 }
 
 Tensor CrossEntropyLoss::compute_gradients(const Tensor& logits, const std::vector<size_t>& targets) {
-    Tensor grad({logits.shape()[0], logits.shape()[1]});
+    Tensor grad(std::vector<size_t>{logits.shape()[0], logits.shape()[1]});
     size_t seq_len = targets.size();
     
     for (size_t t = 0; t < seq_len - 1; ++t) {

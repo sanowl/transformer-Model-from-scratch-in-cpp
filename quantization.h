@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tensor.h"
+#include "attention.h"
 #include <cstdint>
 #include <memory>
 

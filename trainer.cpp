@@ -5,6 +5,20 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
+#include <filesystem>
+#include <regex>
+#include <limits>
+#include <sstream>
+
+#ifdef _WIN32
+    #include <windows.h>
+    #include <psapi.h>
+#else
+    #include <sys/stat.h>
+    #include <unistd.h>
+    #include <sys/resource.h>
+#endif
+#include <sstream>
 
 Trainer::Trainer(const TrainingConfig& config) 
     : config_(config), current_step_(0), best_loss_(std::numeric_limits<float>::max()) {
@@ -225,15 +239,166 @@ void Trainer::load_model(const std::string& path) {
     std::cout << "Model loading not implemented yet" << std::endl;
 }
 
-std::vector<std::string> DataLoader::load_text_file(const std::string& filepath) {
-    std::vector<std::string> texts;
-    std::ifstream file(filepath);
-    std::string line;
+bool DataLoader::is_safe_path(const std::string& filepath) {
+    // Check for path traversal attacks
+    if (filepath.find("..") != std::string::npos) {
+        return false;
+    }
     
-    while (std::getline(file, line)) {
-        if (!line.empty()) {
-            texts.push_back(line);
+    // Check for suspicious characters
+    const std::regex dangerous_chars(R"([<>:"|?*])");
+    if (std::regex_search(filepath, dangerous_chars)) {
+        return false;
+    }
+    
+    // Check path length
+    if (filepath.length() > 260) { // Windows MAX_PATH limit
+        return false;
+    }
+    
+    // Check if path is absolute and within allowed directories
+    std::filesystem::path path(filepath);
+    if (path.is_absolute()) {
+        // Only allow paths in current working directory or subdirectories
+        auto current_path = std::filesystem::current_path();
+        auto canonical_file = std::filesystem::weakly_canonical(path);
+        auto canonical_current = std::filesystem::weakly_canonical(current_path);
+        
+        auto rel_path = std::filesystem::relative(canonical_file, canonical_current);
+        if (rel_path.string().substr(0, 2) == "..") {
+            return false;
         }
+    }
+    
+    return true;
+}
+
+bool DataLoader::validate_file_permissions(const std::string& filepath) {
+#ifdef _WIN32
+    DWORD attrs = GetFileAttributesA(filepath.c_str());
+    return (attrs != INVALID_FILE_ATTRIBUTES) && !(attrs & FILE_ATTRIBUTE_SYSTEM);
+#else
+    struct stat st;
+    if (stat(filepath.c_str(), &st) != 0) {
+        return false;
+    }
+    
+    // Check if file is readable
+    return (st.st_mode & S_IRUSR) != 0;
+#endif
+}
+
+size_t DataLoader::get_file_size(const std::string& filepath) {
+    try {
+        return std::filesystem::file_size(filepath);
+    } catch (const std::filesystem::filesystem_error&) {
+        return 0;
+    }
+}
+
+bool DataLoader::is_valid_utf8(const std::string& text) {
+    for (size_t i = 0; i < text.length(); ) {
+        unsigned char c = text[i];
+        size_t len = 0;
+        
+        if ((c & 0x80) == 0) {
+            len = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+        } else {
+            return false;
+        }
+        
+        if (i + len > text.length()) {
+            return false;
+        }
+        
+        for (size_t j = 1; j < len; ++j) {
+            if ((text[i + j] & 0xC0) != 0x80) {
+                return false;
+            }
+        }
+        
+        i += len;
+    }
+    
+    return true;
+}
+
+void DataLoader::validate_file_access(const std::string& filepath, const LoadOptions& options) {
+    if (!is_safe_path(filepath)) {
+        throw DataLoadError("Unsafe file path: " + filepath);
+    }
+    
+    if (!std::filesystem::exists(filepath)) {
+        throw DataLoadError("File does not exist: " + filepath);
+    }
+    
+    if (!validate_file_permissions(filepath)) {
+        throw DataLoadError("Insufficient file permissions: " + filepath);
+    }
+    
+    size_t file_size = get_file_size(filepath);
+    if (file_size > options.max_file_size) {
+        throw DataLoadError("File too large: " + std::to_string(file_size) + 
+                          " bytes, max: " + std::to_string(options.max_file_size));
+    }
+    
+    if (file_size == 0) {
+        throw DataLoadError("File is empty: " + filepath);
+    }
+}
+
+std::vector<std::string> DataLoader::load_text_file(const std::string& filepath, const LoadOptions& options) {
+    validate_file_access(filepath, options);
+    
+    std::vector<std::string> texts;
+    std::ifstream file(filepath, std::ios::binary);
+    
+    if (!file.is_open()) {
+        throw DataLoadError("Failed to open file: " + filepath);
+    }
+    
+    std::string line;
+    size_t line_count = 0;
+    
+    try {
+        while (std::getline(file, line)) {
+            line_count++;
+            
+            // Skip empty lines if requested
+            if (options.skip_empty_lines && line.empty()) {
+                continue;
+            }
+            
+            // Check line length
+            if (line.length() > options.max_line_length) {
+                throw DataLoadError("Line too long at line " + std::to_string(line_count) + 
+                                  ": " + std::to_string(line.length()) + " chars");
+            }
+            
+            // Validate UTF-8 if requested
+            if (options.validate_utf8 && !is_valid_utf8(line)) {
+                throw DataLoadError("Invalid UTF-8 encoding at line " + std::to_string(line_count));
+            }
+            
+            texts.push_back(line);
+            
+            // Prevent memory exhaustion
+            if (texts.size() > 1000000) { // Reasonable limit
+                throw DataLoadError("Too many lines in file: " + std::to_string(texts.size()));
+            }
+        }
+    } catch (const std::ios_base::failure& e) {
+        throw DataLoadError("I/O error reading file: " + std::string(e.what()));
+    }
+    
+    if (texts.empty()) {
+        throw DataLoadError("No valid lines found in file: " + filepath);
     }
     
     return texts;
@@ -265,33 +430,98 @@ std::vector<std::string> DataLoader::create_sample_data() {
 }
 
 void DataLoader::save_sequences(const std::vector<std::vector<size_t>>& sequences, const std::string& filepath) {
-    std::ofstream file(filepath);
-    for (const auto& seq : sequences) {
-        for (size_t i = 0; i < seq.size(); ++i) {
-            file << seq[i];
-            if (i < seq.size() - 1) file << " ";
+    if (!is_safe_path(filepath)) {
+        throw DataLoadError("Unsafe file path for save: " + filepath);
+    }
+    
+    // Create directory if it doesn't exist
+    std::filesystem::path path(filepath);
+    std::filesystem::path parent = path.parent_path();
+    if (!parent.empty() && !std::filesystem::exists(parent)) {
+        try {
+            std::filesystem::create_directories(parent);
+        } catch (const std::filesystem::filesystem_error& e) {
+            throw DataLoadError("Failed to create directory: " + std::string(e.what()));
         }
-        file << "\n";
+    }
+    
+    std::ofstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        throw DataLoadError("Failed to create file: " + filepath);
+    }
+    
+    try {
+        for (const auto& seq : sequences) {
+            for (size_t i = 0; i < seq.size(); ++i) {
+                file << seq[i];
+                if (i < seq.size() - 1) file << " ";
+            }
+            file << "\n";
+            
+            if (file.fail()) {
+                throw DataLoadError("Write error occurred");
+            }
+        }
+        
+        file.flush();
+        if (file.fail()) {
+            throw DataLoadError("Failed to flush file");
+        }
+    } catch (const std::ios_base::failure& e) {
+        throw DataLoadError("I/O error writing file: " + std::string(e.what()));
     }
 }
 
 std::vector<std::vector<size_t>> DataLoader::load_sequences(const std::string& filepath) {
-    std::vector<std::vector<size_t>> sequences;
-    std::ifstream file(filepath);
-    std::string line;
+    LoadOptions options;
+    validate_file_access(filepath, options);
     
-    while (std::getline(file, line)) {
-        std::istringstream iss(line);
-        std::vector<size_t> seq;
-        size_t token;
-        
-        while (iss >> token) {
-            seq.push_back(token);
+    std::vector<std::vector<size_t>> sequences;
+    std::ifstream file(filepath, std::ios::binary);
+    
+    if (!file.is_open()) {
+        throw DataLoadError("Failed to open sequence file: " + filepath);
+    }
+    
+    std::string line;
+    size_t line_count = 0;
+    
+    try {
+        while (std::getline(file, line)) {
+            line_count++;
+            
+            if (line.empty()) continue;
+            
+            std::istringstream iss(line);
+            std::vector<size_t> seq;
+            std::string token_str;
+            
+            while (iss >> token_str) {
+                try {
+                    size_t token = std::stoull(token_str);
+                    seq.push_back(token);
+                } catch (const std::exception& e) {
+                    throw DataLoadError("Invalid token at line " + std::to_string(line_count) + 
+                                      ": " + token_str);
+                }
+                
+                // Prevent excessively long sequences
+                if (seq.size() > 10000) {
+                    throw DataLoadError("Sequence too long at line " + std::to_string(line_count));
+                }
+            }
+            
+            if (!seq.empty()) {
+                sequences.push_back(seq);
+            }
+            
+            // Prevent memory exhaustion
+            if (sequences.size() > 1000000) {
+                throw DataLoadError("Too many sequences: " + std::to_string(sequences.size()));
+            }
         }
-        
-        if (!seq.empty()) {
-            sequences.push_back(seq);
-        }
+    } catch (const std::ios_base::failure& e) {
+        throw DataLoadError("I/O error reading sequence file: " + std::string(e.what()));
     }
     
     return sequences;

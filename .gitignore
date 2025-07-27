@@ -1,0 +1,59 @@
+# Compiled Object files
+*.o
+*.obj
+
+# Executables
+*.exe
+*.out
+*.app
+debug_test
+simple_test
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Static and dynamic libraries
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build directories
+build/
+bin/
+obj/
+dist/
+
+# Test executables and debug programs
+debug_*
+*_test
+test_*
+
+# Core dumps
+core
+*.core
+
+# Profiling data
+gmon.out
+*.gcov
+*.gcda
+*.gcno

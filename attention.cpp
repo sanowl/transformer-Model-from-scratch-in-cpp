@@ -3,12 +3,25 @@
 #include <random>
 #include <algorithm>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 
 MultiHeadAttention::MultiHeadAttention(size_t d_model, size_t n_heads, float dropout)
     : d_model_(d_model), n_heads_(n_heads), dropout_rate_(dropout) {
     
+    // Input validation
+    if (d_model == 0) {
+        throw std::invalid_argument("d_model must be positive");
+    }
+    if (n_heads == 0) {
+        throw std::invalid_argument("n_heads must be positive");
+    }
     if (d_model % n_heads != 0) {
-        throw std::invalid_argument("d_model must be divisible by n_heads");
+        throw std::invalid_argument("d_model (" + std::to_string(d_model) + 
+                                  ") must be divisible by n_heads (" + std::to_string(n_heads) + ")");
+    }
+    if (dropout < 0.0f || dropout > 1.0f) {
+        throw std::invalid_argument("dropout rate must be between 0 and 1, got: " + std::to_string(dropout));
     }
     
     d_k_ = d_model / n_heads;
@@ -42,28 +55,82 @@ void MultiHeadAttention::init_parameters() {
 }
 
 Tensor MultiHeadAttention::linear_transform(const Tensor& input, const Tensor& weight, const Tensor& bias) {
-    Tensor output = input.matmul(weight);
-    
-    for (size_t i = 0; i < output.matrix().rows(); ++i) {
-        for (size_t j = 0; j < output.matrix().cols(); ++j) {
-            output.matrix()(i, j) += bias.matrix()(0, j);
-        }
+    // Validate input dimensions
+    if (input.shape().size() != 2 || weight.shape().size() != 2 || bias.shape().size() != 2) {
+        throw TensorShapeError("linear_transform requires 2D tensors");
     }
     
-    return output;
+    if (input.shape()[1] != weight.shape()[0]) {
+        throw TensorShapeError("Input dimension mismatch for linear transform. "
+                             "Input cols: " + std::to_string(input.shape()[1]) + 
+                             ", Weight rows: " + std::to_string(weight.shape()[0]));
+    }
+    
+    if (weight.shape()[1] != bias.shape()[1]) {
+        throw TensorShapeError("Weight and bias dimension mismatch");
+    }
+    
+    try {
+        Tensor output = input.matmul(weight);
+        
+        // Add bias with broadcasting
+        for (size_t i = 0; i < output.matrix().rows(); ++i) {
+            for (size_t j = 0; j < output.matrix().cols(); ++j) {
+                output.matrix()(i, j) += bias.matrix()(0, j);
+            }
+        }
+        
+        return output;
+    } catch (const std::exception& e) {
+        throw TensorMemoryError("Failed in linear transformation: " + std::string(e.what()));
+    }
 }
 
 Tensor MultiHeadAttention::split_heads(const Tensor& x, size_t batch_size, size_t seq_len) {
-    std::vector<size_t> new_shape = {batch_size, seq_len, n_heads_, d_k_};
-    Tensor reshaped = x.reshape(new_shape);
+    // Input tensor should have shape [seq_len, d_model]
+    // We need to reshape to [batch_size, seq_len, n_heads, d_k] then permute to [batch_size, n_heads, seq_len, d_k]
     
-    std::vector<size_t> perm_shape = {batch_size, n_heads_, seq_len, d_k_};
-    return reshaped.view(perm_shape);
+    // First, ensure we have the correct input shape
+    if (x.shape().size() != 2 || x.shape()[0] != seq_len || x.shape()[1] != d_model_) {
+        throw std::invalid_argument("Input tensor has incorrect shape for split_heads");
+    }
+    
+    // Create a new tensor with the correct shape for multi-head attention
+    // For simplicity, we'll work with [seq_len, n_heads, d_k] and treat batch_size as 1
+    std::vector<size_t> new_shape = {seq_len, n_heads_, d_k_};
+    Tensor result(new_shape);
+    
+    // Reshape the input from [seq_len, d_model] to [seq_len, n_heads, d_k]
+    for (size_t seq = 0; seq < seq_len; ++seq) {
+        for (size_t head = 0; head < n_heads_; ++head) {
+            for (size_t k = 0; k < d_k_; ++k) {
+                size_t input_col = head * d_k_ + k;
+                result.matrix()(seq * n_heads_ + head, k) = x.matrix()(seq, input_col);
+            }
+        }
+    }
+    
+    return result;
 }
 
 Tensor MultiHeadAttention::combine_heads(const Tensor& x, size_t batch_size, size_t seq_len) {
-    std::vector<size_t> new_shape = {batch_size, seq_len, d_model_};
-    return x.view(new_shape);
+    // Input tensor should have shape [seq_len * n_heads, d_k]
+    // We need to combine back to [seq_len, d_model]
+    
+    std::vector<size_t> result_shape = {seq_len, d_model_};
+    Tensor result(result_shape);
+    
+    // Combine the heads back to original shape
+    for (size_t seq = 0; seq < seq_len; ++seq) {
+        for (size_t head = 0; head < n_heads_; ++head) {
+            for (size_t k = 0; k < d_k_; ++k) {
+                size_t output_col = head * d_k_ + k;
+                result.matrix()(seq, output_col) = x.matrix()(seq * n_heads_ + head, k);
+            }
+        }
+    }
+    
+    return result;
 }
 
 Tensor MultiHeadAttention::apply_mask(const Tensor& scores, const Tensor& mask) {
@@ -89,8 +156,8 @@ Tensor MultiHeadAttention::dropout(const Tensor& x, bool training) {
         return x;
     }
     
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
     std::bernoulli_distribution dis(1.0f - dropout_rate_);
     
     Tensor result = x;
@@ -111,13 +178,29 @@ Tensor MultiHeadAttention::dropout(const Tensor& x, bool training) {
 
 Tensor MultiHeadAttention::scaled_dot_product_attention(const Tensor& Q, const Tensor& K, const Tensor& V,
                                                        const Tensor* mask, bool training) {
+    // Input validation
+    if (Q.shape().size() != 2 || K.shape().size() != 2 || V.shape().size() != 2) {
+        throw TensorShapeError("Attention inputs must be 2D tensors");
+    }
+    
+    if (Q.shape()[1] != K.shape()[1]) {
+        throw TensorShapeError("Q and K must have same hidden dimension");
+    }
+    
+    if (K.shape()[0] != V.shape()[0]) {
+        throw TensorShapeError("K and V must have same sequence length");
+    }
+    
+    if (d_k_ == 0) {
+        throw std::runtime_error("d_k_ is zero, cannot compute attention scale");
+    }
     
     float scale = 1.0f / std::sqrt(static_cast<float>(d_k_));
     
     Tensor K_transposed = K.transpose();
     Tensor scores = Q.matmul(K_transposed);
     scores *= scale;
-    
+
     if (mask) {
         scores = apply_mask(scores, *mask);
     }
@@ -160,8 +243,24 @@ std::vector<Tensor*> MultiHeadAttention::parameters() {
 
 PositionalEncoding::PositionalEncoding(size_t d_model, size_t max_seq_len)
     : d_model_(d_model), max_seq_len_(max_seq_len) {
-    encoding_ = std::make_unique<Tensor>(std::vector<size_t>{max_seq_len, d_model});
-    compute_encoding();
+    
+    // Input validation
+    if (d_model == 0) {
+        throw std::invalid_argument("d_model must be positive");
+    }
+    if (max_seq_len == 0) {
+        throw std::invalid_argument("max_seq_len must be positive");
+    }
+    if (max_seq_len > 1000000) { // Reasonable upper limit
+        throw std::invalid_argument("max_seq_len too large: " + std::to_string(max_seq_len));
+    }
+    
+    try {
+        encoding_ = std::make_unique<Tensor>(std::vector<size_t>{max_seq_len, d_model});
+        compute_encoding();
+    } catch (const std::exception& e) {
+        throw TensorMemoryError("Failed to create positional encoding: " + std::string(e.what()));
+    }
 }
 
 void PositionalEncoding::compute_encoding() {
@@ -169,7 +268,8 @@ void PositionalEncoding::compute_encoding() {
     
     for (size_t pos = 0; pos < max_seq_len_; ++pos) {
         for (size_t i = 0; i < d_model_; ++i) {
-            float angle = static_cast<float>(pos) / std::pow(10000.0f, (2.0f * (i / 2)) / static_cast<float>(d_model_));
+            // Fix integer division issue: ensure floating point division
+            float angle = static_cast<float>(pos) / std::pow(10000.0f, (2.0f * static_cast<float>(i / 2)) / static_cast<float>(d_model_));
             
             if (i % 2 == 0) {
                 pe(pos, i) = std::sin(angle);
@@ -181,14 +281,34 @@ void PositionalEncoding::compute_encoding() {
 }
 
 Tensor PositionalEncoding::forward(const Tensor& x) {
-    size_t seq_len = x.shape()[0];
-    
-    if (seq_len > max_seq_len_) {
-        throw std::invalid_argument("Sequence length exceeds maximum positional encoding length");
+    // Input validation
+    if (x.shape().size() != 2) {
+        throw TensorShapeError("PositionalEncoding input must be 2D tensor");
     }
     
-    Tensor pe_slice = encoding_->view({seq_len, d_model_});
-    return x + pe_slice;
+    size_t seq_len = x.shape()[0];
+    size_t input_d_model = x.shape()[1];
+    
+    if (seq_len == 0) {
+        throw TensorShapeError("Sequence length cannot be zero");
+    }
+    
+    if (input_d_model != d_model_) {
+        throw TensorShapeError("Input d_model (" + std::to_string(input_d_model) + 
+                             ") doesn't match expected (" + std::to_string(d_model_) + ")");
+    }
+    
+    if (seq_len > max_seq_len_) {
+        throw TensorShapeError("Sequence length (" + std::to_string(seq_len) + 
+                             ") exceeds maximum (" + std::to_string(max_seq_len_) + ")");
+    }
+    
+    try {
+        Tensor pe_slice = encoding_->view({seq_len, d_model_});
+        return x + pe_slice;
+    } catch (const std::exception& e) {
+        throw TensorMemoryError("Failed in positional encoding forward pass: " + std::string(e.what()));
+    }
 }
 
 LayerNorm::LayerNorm(size_t d_model, float eps)
@@ -253,8 +373,8 @@ Tensor FeedForward::dropout(const Tensor& x, bool training) {
         return x;
     }
     
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
     std::bernoulli_distribution dis(1.0f - dropout_rate_);
     
     Tensor result = x;

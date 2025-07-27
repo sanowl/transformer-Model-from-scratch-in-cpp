@@ -3,9 +3,11 @@
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
+#include <unordered_set>
+#include <queue>
 
 Tensor::Tensor(const std::vector<size_t>& shape, bool requires_grad)
-    : shape_(shape), requires_grad_(requires_grad) {
+    : shape_(shape), requires_grad_(requires_grad), is_leaf_(true), version_(0) {
     if (shape.empty()) {
         throw std::invalid_argument("Tensor shape cannot be empty");
     }
@@ -23,13 +25,14 @@ Tensor::Tensor(const std::vector<size_t>& shape, bool requires_grad)
 }
 
 Tensor::Tensor(const Matrix& matrix, bool requires_grad)
-    : requires_grad_(requires_grad) {
+    : requires_grad_(requires_grad), is_leaf_(true), version_(0) {
     shape_ = {matrix.rows(), matrix.cols()};
     data_ = std::make_unique<Matrix>(matrix);
 }
 
 Tensor::Tensor(const Tensor& other)
-    : shape_(other.shape_), requires_grad_(other.requires_grad_) {
+    : shape_(other.shape_), requires_grad_(other.requires_grad_), 
+      is_leaf_(other.is_leaf_), version_(0) {
     data_ = std::make_unique<Matrix>(*other.data_);
     if (other.grad_) {
         grad_ = std::make_unique<Tensor>(*other.grad_);
@@ -38,7 +41,9 @@ Tensor::Tensor(const Tensor& other)
 
 Tensor::Tensor(Tensor&& other) noexcept
     : shape_(std::move(other.shape_)), requires_grad_(other.requires_grad_),
-      data_(std::move(other.data_)), grad_(std::move(other.grad_)) {
+      data_(std::move(other.data_)), grad_(std::move(other.grad_)),
+      backward_fn_(std::move(other.backward_fn_)), parents_(std::move(other.parents_)),
+      is_leaf_(other.is_leaf_), version_(other.version_) {
 }
 
 Tensor& Tensor::operator=(const Tensor& other) {
@@ -77,8 +82,52 @@ void Tensor::zero_grad() {
 
 void Tensor::init_grad() {
     if (requires_grad_ && !grad_) {
-        grad_ = std::make_unique<Tensor>(shape_, false);
-        grad_->zero_();
+        try {
+            grad_ = std::make_unique<Tensor>(shape_, false);
+            grad_->zero_();
+        } catch (const std::exception& e) {
+            throw TensorMemoryError("Failed to initialize gradient tensor: " + std::string(e.what()));
+        }
+    }
+}
+
+void Tensor::check_grad_compatibility(const Tensor& grad) const {
+    if (grad.shape() != shape_) {
+        throw TensorGradientError("Gradient shape mismatch. Expected shape matches tensor shape");
+    }
+}
+
+void Tensor::accumulate_grad(const Tensor& grad) {
+    check_grad_compatibility(grad);
+    
+    if (!grad_) {
+        init_grad();
+    }
+    
+    *grad_ += grad;
+}
+
+// Removed shared_from_this function for simplicity
+
+void Tensor::backward(const Tensor* grad_output) {
+    if (!requires_grad_) {
+        return;
+    }
+    
+    // Initialize gradient if this is the root of backpropagation
+    if (grad_output == nullptr) {
+        if (numel() != 1) {
+            throw TensorGradientError("Backward can only be called on scalar tensors without grad_output");
+        }
+        init_grad();
+        grad_->fill_(1.0f);
+    } else {
+        accumulate_grad(*grad_output);
+    }
+    
+    // Execute backward function if available
+    if (backward_fn_) {
+        backward_fn_();
     }
 }
 
@@ -131,7 +180,18 @@ const float& Tensor::operator[](const std::vector<size_t>& indices) const {
 
 void Tensor::validate_shape_compatibility(const Tensor& other) const {
     if (shape_ != other.shape_) {
-        throw std::invalid_argument("Tensor shapes are incompatible");
+        std::string msg = "Tensor shapes are incompatible. This: [";
+        for (size_t i = 0; i < shape_.size(); ++i) {
+            msg += std::to_string(shape_[i]);
+            if (i < shape_.size() - 1) msg += ", ";
+        }
+        msg += "], Other: [";
+        for (size_t i = 0; i < other.shape_.size(); ++i) {
+            msg += std::to_string(other.shape_[i]);
+            if (i < other.shape_.size() - 1) msg += ", ";
+        }
+        msg += "]";
+        throw TensorShapeError(msg);
     }
 }
 
@@ -350,4 +410,151 @@ void Tensor::print() const {
 
 Tensor operator*(float scalar, const Tensor& tensor) {
     return tensor * scalar;
+}
+
+std::vector<size_t> Tensor::broadcast_shapes(const std::vector<size_t>& shape1, 
+                                        const std::vector<size_t>& shape2) const {
+    // NumPy-style broadcasting rules
+    size_t max_dims = std::max(shape1.size(), shape2.size());
+    std::vector<size_t> result_shape(max_dims);
+    
+    // Pad shorter shape with 1s on the left
+    std::vector<size_t> padded_shape1(max_dims, 1);
+    std::vector<size_t> padded_shape2(max_dims, 1);
+    
+    // Copy shapes to the right (end) of padded vectors
+    std::copy(shape1.rbegin(), shape1.rend(), padded_shape1.rbegin());
+    std::copy(shape2.rbegin(), shape2.rend(), padded_shape2.rbegin());
+    
+    // Apply broadcasting rules
+    for (size_t i = 0; i < max_dims; ++i) {
+        size_t dim1 = padded_shape1[i];
+        size_t dim2 = padded_shape2[i];
+        
+        if (dim1 == dim2) {
+            result_shape[i] = dim1;
+        } else if (dim1 == 1) {
+            result_shape[i] = dim2;
+        } else if (dim2 == 1) {
+            result_shape[i] = dim1;
+        } else {
+            throw TensorShapeError("Incompatible shapes for broadcasting: dimension " + 
+                                 std::to_string(i) + " has sizes " + std::to_string(dim1) + 
+                                 " and " + std::to_string(dim2));
+        }
+    }
+    
+    return result_shape;
+}
+
+// Factory functions
+std::shared_ptr<Tensor> make_tensor(const std::vector<size_t>& shape, bool requires_grad) {
+    auto tensor = std::make_shared<Tensor>(shape, requires_grad);
+    tensor->set_self_ptr(tensor);
+    return tensor;
+}
+
+std::shared_ptr<Tensor> make_tensor(const Matrix& matrix, bool requires_grad) {
+    auto tensor = std::make_shared<Tensor>(matrix, requires_grad);
+    tensor->set_self_ptr(tensor);
+    return tensor;
+}
+
+// Automatic differentiation operations
+std::shared_ptr<Tensor> add_op(std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b) {
+    if (!a || !b) {
+        throw TensorMemoryError("Null tensor pointer in add operation");
+    }
+    
+    a->validate_shape_compatibility(*b);
+    auto result = make_tensor(a->shape(), a->requires_grad() || b->requires_grad());
+    result->matrix() = a->matrix() + b->matrix();
+    result->set_leaf(false);
+    
+    if (GradientContext::instance().is_grad_enabled() && result->requires_grad()) {
+        result->add_parent(a);
+        result->add_parent(b);
+        
+        result->set_backward_fn([a, b, result]() {
+            if (a->requires_grad()) {
+                a->accumulate_grad(*result->grad_);
+            }
+            if (b->requires_grad()) {
+                b->accumulate_grad(*result->grad_);
+            }
+        });
+    }
+    
+    return result;
+}
+
+std::shared_ptr<Tensor> sub_op(std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b) {
+    if (!a || !b) {
+        throw TensorMemoryError("Null tensor pointer in sub operation");
+    }
+    
+    a->validate_shape_compatibility(*b);
+    auto result = make_tensor(a->shape(), a->requires_grad() || b->requires_grad());
+    result->matrix() = a->matrix() - b->matrix();
+    result->set_leaf(false);
+    
+    if (GradientContext::instance().is_grad_enabled() && result->requires_grad()) {
+        result->add_parent(a);
+        result->add_parent(b);
+        
+        result->set_backward_fn([a, b, result]() {
+            if (a->requires_grad()) {
+                a->accumulate_grad(*result->grad_);
+            }
+            if (b->requires_grad()) {
+                auto neg_grad = *result->grad_ * (-1.0f);
+                b->accumulate_grad(neg_grad);
+            }
+        });
+    }
+    
+    return result;
+}
+
+std::shared_ptr<Tensor> matmul_op(std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b) {
+    if (!a || !b) {
+        throw TensorMemoryError("Null tensor pointer in matmul operation");
+    }
+    
+    if (a->shape().size() != 2 || b->shape().size() != 2) {
+        throw TensorShapeError("Matrix multiplication requires 2D tensors");
+    }
+    
+    if (a->shape()[1] != b->shape()[0]) {
+        throw TensorShapeError("Incompatible shapes for matrix multiplication");
+    }
+    
+    std::vector<size_t> result_shape = {a->shape()[0], b->shape()[1]};
+    auto result = make_tensor(result_shape, a->requires_grad() || b->requires_grad());
+    result->matrix() = a->matrix() * b->matrix();
+    result->set_leaf(false);
+    
+    if (GradientContext::instance().is_grad_enabled() && result->requires_grad()) {
+        result->add_parent(a);
+        result->add_parent(b);
+        
+        result->set_backward_fn([a, b, result]() {
+            if (a->requires_grad()) {
+                auto a_grad = result->grad_->matmul(b->transpose());
+                a->accumulate_grad(a_grad);
+            }
+            if (b->requires_grad()) {
+                auto b_grad = a->transpose().matmul(*result->grad_);
+                b->accumulate_grad(b_grad);
+            }
+        });
+    }
+    
+    return result;
+}
+
+// Gradient context singleton
+GradientContext& GradientContext::instance() {
+    static GradientContext ctx;
+    return ctx;
 }

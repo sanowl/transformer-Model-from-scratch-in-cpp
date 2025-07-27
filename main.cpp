@@ -1,4 +1,5 @@
 #include "trainer.h"
+#include <iomanip>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -34,7 +35,7 @@ void demonstrate_components() {
     
     // Tensor operations
     std::cout << "\n2. Tensor Operations:" << std::endl;
-    Tensor x({2, 4});
+    Tensor x(std::vector<size_t>{2, 4});
     x.uniform_(-1.0f, 1.0f);
     std::cout << "Random tensor:" << std::endl;
     x.print();
@@ -50,7 +51,7 @@ void demonstrate_components() {
     
     MultiHeadAttention attention(d_model, n_heads);
     
-    Tensor query({4, d_model});
+    Tensor query(std::vector<size_t>{4, d_model});
     query.normal_(0.0f, 0.1f);
     
     Tensor key = query;
